@@ -9,7 +9,7 @@
 # Auto-restarts after cooldown, only if host internet is healthy.
 # Caps restart attempts per hour and writes separate last-leak / last-restart markers.
 
-CONTAINER="${CONTAINER:-transmission-new}"
+CONTAINER="${CONTAINER:?Error: CONTAINER env var must be set}"
 
 LOCKFILE="/tmp/ipcheck.lock"
 RESTARTSTAMP="/tmp/${CONTAINER}.restart.last"

@@ -87,7 +87,7 @@ All variables can be set as environment variables before the script runs. Each f
 
 | Variable | Default | Description |
 |---|---|---|
-| `CONTAINER` | `transmission-new` | Docker container name |
+| `CONTAINER` | _(required)_ | Docker container name |
 | `LOGDIR` | `/volume1/docker/$CONTAINER` | Directory for log files |
 | `MARKER_DIR` | _(unset)_ | Directory for Gotify JSON marker files — omit to disable marker output entirely |
 | `GRACE_SECONDS` | `120` | Seconds to skip checks after container start |
