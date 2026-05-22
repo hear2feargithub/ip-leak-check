@@ -10,6 +10,7 @@
 # Caps restart attempts per hour and writes separate last-leak / last-restart markers.
 
 CONTAINER="${CONTAINER:?Error: CONTAINER env var must be set}"
+DOCKER="${DOCKER:-/usr/local/bin/docker}"
 
 LOCKFILE="/tmp/ipcheck.lock"
 RESTARTSTAMP="/tmp/${CONTAINER}.restart.last"
@@ -126,13 +127,13 @@ increment_restart_count() {
 
 set_restart_policy() {
     local policy="$1"
-    docker update --restart "$policy" "$CONTAINER" >/dev/null 2>&1
+    $DOCKER update --restart "$policy" "$CONTAINER" >/dev/null 2>&1
 }
 
 # --- start ---
 rotate_logs
 
-RUNNING="$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)"
+RUNNING="$($DOCKER inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)"
 
 # --- container stopped path ---
 if [ "$RUNNING" != "true" ]; then
@@ -176,7 +177,7 @@ if [ "$RUNNING" != "true" ]; then
 
         set_restart_policy "$RESTART_POLICY_SAFE"
 
-        if docker start "$CONTAINER" >/dev/null 2>&1; then
+        if $DOCKER start "$CONTAINER" >/dev/null 2>&1; then
             log "Container $CONTAINER started successfully; startup grace period will apply"
             write_json_marker "$LAST_RESTART_FILE" "restart_succeeded" "" "" "container started successfully after leak event"
         else
@@ -210,7 +211,7 @@ if [ "$RUNNING" != "true" ]; then
 
     set_restart_policy "$RESTART_POLICY_SAFE"
 
-    if docker start "$CONTAINER" >/dev/null 2>&1; then
+    if $DOCKER start "$CONTAINER" >/dev/null 2>&1; then
         log "Container $CONTAINER started successfully after unexpected stop; startup grace period will apply"
         write_json_marker "$LAST_RESTART_FILE" "restart_unexpected_stop" "" "" "container restarted after unexpected stop"
     else
@@ -222,7 +223,7 @@ if [ "$RUNNING" != "true" ]; then
 fi
 
 # --- detect container uptime (grace period) ---
-UPTIME="$(docker inspect -f '{{.State.StartedAt}}' "$CONTAINER" 2>/dev/null | xargs -I{} date -d {} +%s 2>/dev/null)"
+UPTIME="$($DOCKER inspect -f '{{.State.StartedAt}}' "$CONTAINER" 2>/dev/null | xargs -I{} date -d {} +%s 2>/dev/null)"
 NOWSEC="$(date +%s)"
 
 if [ -n "$UPTIME" ]; then
@@ -234,7 +235,7 @@ if [ -n "$UPTIME" ]; then
 fi
 
 # --- fast check: VPN tunnel interface (every 10s) ---
-if ! docker exec "$CONTAINER" ip link show tun0 2>/dev/null | grep -q "UP"; then
+if ! $DOCKER exec "$CONTAINER" ip link show tun0 2>/dev/null | grep -q "UP"; then
     if ( set -C; : > "$LOCKFILE" ) 2>/dev/null; then
         log "VPN tunnel down (tun0 not UP); stopping container $CONTAINER"
 
@@ -254,7 +255,7 @@ if ! docker exec "$CONTAINER" ip link show tun0 2>/dev/null | grep -q "UP"; then
 
         set_restart_policy "$RESTART_POLICY_LEAK"
 
-        if docker stop "$CONTAINER" >/dev/null 2>&1; then
+        if $DOCKER stop "$CONTAINER" >/dev/null 2>&1; then
             log "Container $CONTAINER stopped due to VPN tunnel down"
         else
             log "Warning: failed to stop container $CONTAINER after tun0-down detection"
@@ -281,7 +282,7 @@ fi
 echo "$NOWSEC" > "$LAST_FULL_CHECK_FILE"
 
 PUBLIC_IP="$(curl -s --max-time 5 --retry 2 ifconfig.me 2>/dev/null)"
-CONTAINER_IP="$(docker exec "$CONTAINER" curl -s --max-time 10 --retry 2 ifconfig.me 2>/dev/null)"
+CONTAINER_IP="$($DOCKER exec "$CONTAINER" curl -s --max-time 10 --retry 2 ifconfig.me 2>/dev/null)"
 
 if [ -z "$PUBLIC_IP" ] || [ -z "$CONTAINER_IP" ]; then
     log "Warning: IP check skipped (blank response)"
@@ -320,7 +321,7 @@ if [ "$PUBLIC_IP" = "$CONTAINER_IP" ]; then
 
         set_restart_policy "$RESTART_POLICY_LEAK"
 
-        if docker stop "$CONTAINER" >/dev/null 2>&1; then
+        if $DOCKER stop "$CONTAINER" >/dev/null 2>&1; then
             log "Container $CONTAINER stopped due to IP leak"
         else
             log "Warning: failed to stop container $CONTAINER after leak detection"
