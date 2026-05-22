@@ -1,6 +1,6 @@
 # IP Leak Watchdog
 
-A watchdog script for Synology DSM 7.2.x that runs every minute via cron and stops a Transmission+VPN Docker container if the VPN leaks the host's real IP address. Automatically restarts the container once the VPN recovers.
+A watchdog script for Synology DSM 7.2.x that runs every 10 seconds and stops a Transmission+VPN Docker container if your real IP address is exposed. This covers two failure modes: the VPN tunnel dropping inside the container (detected instantly via `tun0`), and the VPN provider itself leaking your real IP despite an active tunnel (detected via external IP comparison). Automatically restarts the container once the VPN recovers.
 
 ## How it works
 
