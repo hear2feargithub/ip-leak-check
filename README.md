@@ -74,7 +74,7 @@ ssh your_user@your-nas "chmod +x /path/to/transmission/ip-leak-check.sh"
 2. Add a cron entry by editing `/etc/crontab` directly as root, passing your paths as environment variables:
 
 ```
-* * * * * root /bin/sh -c 'CONTAINER=your-container LOGDIR=/path/to/transmission MARKER_DIR=/path/to/gotify/markers; i=0; while [ $i -lt 6 ]; do /path/to/transmission/ip-leak-check.sh; i=$((i+1)); [ $i -lt 6 ] && sleep 10; done'
+* * * * * root /bin/sh -c 'export CONTAINER=your-container LOGDIR=/path/to/transmission; i=0; while [ $i -lt 6 ]; do /path/to/transmission/ip-leak-check.sh; i=$((i+1)); [ $i -lt 6 ] && sleep 10; done'
 ```
 
 This runs the script every 10 seconds (6 times per minute). The fast `tun0` check fires on every run; the external IP check is throttled internally to once per minute.
