@@ -1,0 +1,3 @@
+# Documented example values, not live infrastructure.
+# One ERE per line; matching findings are dropped by the pre-push PII scan.
+LOCAL_NETWORK=192\.168\.1\.0/24
