@@ -11,6 +11,9 @@
 # v2.2: run-lock breaks on mtime age (the only guard that survives PID reuse) and
 #       verifies PID identity via /proc/<pid>/cmdline; every docker exec is bounded
 #       by timeout; dead-man's switch alerts if ip-leak.log stops advancing.
+# v2.3: every docker call is bounded, not just exec -- inspect/update/start/stop can
+#       hang on a wedged dockerd too. Stop gets a longer budget than control-plane
+#       calls because it has its own SIGTERM grace. Timeouts are logged.
 
 CONTAINER="${CONTAINER:?Error: CONTAINER env var must be set}"
 DOCKER="${DOCKER:-/usr/local/bin/docker}"
@@ -39,6 +42,8 @@ LAST_FULL_CHECK_FILE="/tmp/${CONTAINER}.last-full-check"
 
 RUNLOCK_MAX_AGE="${RUNLOCK_MAX_AGE:-120}"         # break the run-lock unconditionally past this age
 DOCKER_EXEC_TIMEOUT="${DOCKER_EXEC_TIMEOUT:-15}"  # hard cap on any single docker exec
+DOCKER_TIMEOUT="${DOCKER_TIMEOUT:-15}"            # hard cap on inspect/update/start
+DOCKER_STOP_TIMEOUT="${DOCKER_STOP_TIMEOUT:-30}"  # docker stop has its own 10s SIGTERM grace
 TIMEOUT_BIN="${TIMEOUT_BIN:-/usr/bin/timeout}"    # not on PATH under cron on DSM
 
 DEADMAN_MAX_AGE="${DEADMAN_MAX_AGE:-300}"         # alert if the log stops advancing for this long (0 disables)
@@ -141,9 +146,29 @@ increment_restart_count() {
     echo "$count" > "$RESTARTCOUNTFILE"
 }
 
+# Every docker call goes through here so none can block forever. curl's
+# --max-time bounds only what runs *inside* the container, and the docker client
+# itself waits indefinitely on an unresponsive dockerd -- that is what produced
+# the stuck instance that stranded the run-lock on 2026-09-01.
+docker_run() {   # docker_run <timeout-secs> <label> <docker args...>
+    local t="$1" label="$2"; shift 2
+    local rc
+    if [ -n "$TIMEOUT_BIN" ]; then
+        $TIMEOUT_BIN "$t" $DOCKER "$@"
+        rc=$?
+    else
+        $DOCKER "$@"
+        rc=$?
+    fi
+    # Sent to stderr so it can never contaminate a captured stdout value; the
+    # log file still receives it via tee even when the caller discards stderr.
+    [ "$rc" -eq 124 ] && log "Warning: docker $label timed out after ${t}s (dockerd unresponsive?)" >&2
+    return $rc
+}
+
 set_restart_policy() {
     local policy="$1"
-    $DOCKER update --restart "$policy" "$CONTAINER" >/dev/null 2>&1
+    docker_run "$DOCKER_TIMEOUT" "update --restart $policy" update --restart "$policy" "$CONTAINER" >/dev/null 2>&1
 }
 
 gotify_push() {   # gotify_push <title> <priority> <message>
@@ -202,6 +227,11 @@ deadman_check() {
         "$(hostname): $LOGFILE has not advanced in $((stalled_for / 60))m. The leak check is not running, so VPN leak protection for $CONTAINER may be OFF."
 }
 
+if [ ! -x "$TIMEOUT_BIN" ]; then
+    log "Warning: TIMEOUT_BIN '$TIMEOUT_BIN' is not executable; docker calls will run unbounded"
+    TIMEOUT_BIN=""
+fi
+
 deadman_check
 
 # --- run-lock: exit if another instance is already running ---
@@ -242,7 +272,9 @@ trap 'rm -f "$RUNLOCK"' EXIT INT TERM
 # --- start ---
 rotate_logs
 
-RUNNING="$($DOCKER inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)"
+# A timeout leaves this empty, which the stopped-path below already handles the
+# same way it handles a container that does not exist.
+RUNNING="$(docker_run "$DOCKER_TIMEOUT" "inspect(Running)" inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)"
 
 # --- container stopped path ---
 if [ "$RUNNING" != "true" ]; then
@@ -286,7 +318,7 @@ if [ "$RUNNING" != "true" ]; then
 
         set_restart_policy "$RESTART_POLICY_SAFE"
 
-        if $DOCKER start "$CONTAINER" >/dev/null 2>&1; then
+        if docker_run "$DOCKER_TIMEOUT" "start" start "$CONTAINER" >/dev/null 2>&1; then
             log "Container $CONTAINER started successfully; startup grace period will apply"
             write_json_marker "$LAST_RESTART_FILE" "restart_succeeded" "" "" "container started successfully after leak event"
         else
@@ -320,7 +352,7 @@ if [ "$RUNNING" != "true" ]; then
 
     set_restart_policy "$RESTART_POLICY_SAFE"
 
-    if $DOCKER start "$CONTAINER" >/dev/null 2>&1; then
+    if docker_run "$DOCKER_TIMEOUT" "start" start "$CONTAINER" >/dev/null 2>&1; then
         log "Container $CONTAINER started successfully after unexpected stop; startup grace period will apply"
         write_json_marker "$LAST_RESTART_FILE" "restart_unexpected_stop" "" "" "container restarted after unexpected stop"
     else
@@ -332,7 +364,7 @@ if [ "$RUNNING" != "true" ]; then
 fi
 
 # --- detect container uptime (grace period) ---
-UPTIME="$($DOCKER inspect -f '{{.State.StartedAt}}' "$CONTAINER" 2>/dev/null | xargs -I{} date -d {} +%s 2>/dev/null)"
+UPTIME="$(docker_run "$DOCKER_TIMEOUT" "inspect(StartedAt)" inspect -f '{{.State.StartedAt}}' "$CONTAINER" 2>/dev/null | xargs -I{} date -d {} +%s 2>/dev/null)"
 NOWSEC="$(date +%s)"
 
 if [ -n "$UPTIME" ]; then
@@ -346,7 +378,7 @@ fi
 # --- fast check: VPN tunnel interface (every 10s) ---
 # A timeout here is treated as "tunnel not verifiable" and so fails closed
 # (container stopped), which is the safe direction for a leak guard.
-if ! $TIMEOUT_BIN "$DOCKER_EXEC_TIMEOUT" $DOCKER exec "$CONTAINER" ip link show tun0 2>/dev/null | grep -q "UP"; then
+if ! docker_run "$DOCKER_EXEC_TIMEOUT" "exec(ip link tun0)" exec "$CONTAINER" ip link show tun0 2>/dev/null | grep -q "UP"; then
     if ( set -C; : > "$LOCKFILE" ) 2>/dev/null; then
         log "VPN tunnel down (tun0 not UP); stopping container $CONTAINER"
 
@@ -366,7 +398,7 @@ if ! $TIMEOUT_BIN "$DOCKER_EXEC_TIMEOUT" $DOCKER exec "$CONTAINER" ip link show 
 
         set_restart_policy "$RESTART_POLICY_LEAK"
 
-        if $DOCKER stop "$CONTAINER" >/dev/null 2>&1; then
+        if docker_run "$DOCKER_STOP_TIMEOUT" "stop" stop "$CONTAINER" >/dev/null 2>&1; then
             log "Container $CONTAINER stopped due to VPN tunnel down"
         else
             log "Warning: failed to stop container $CONTAINER after tun0-down detection"
@@ -395,7 +427,7 @@ echo "$NOWSEC" > "$LAST_FULL_CHECK_FILE"
 PUBLIC_IP="$(curl -s --max-time 5 --retry 2 ifconfig.me 2>/dev/null)"
 # curl --max-time bounds the inner curl only; docker exec itself can hang
 # indefinitely on an unresponsive dockerd, which is what stranded the run-lock.
-CONTAINER_IP="$($TIMEOUT_BIN "$DOCKER_EXEC_TIMEOUT" $DOCKER exec "$CONTAINER" curl -s --max-time 10 --retry 2 ifconfig.me 2>/dev/null)"
+CONTAINER_IP="$(docker_run "$DOCKER_EXEC_TIMEOUT" "exec(curl ifconfig.me)" exec "$CONTAINER" curl -s --max-time 10 --retry 2 ifconfig.me 2>/dev/null)"
 
 if [ -z "$PUBLIC_IP" ] || [ -z "$CONTAINER_IP" ]; then
     log "Warning: IP check skipped (blank response)"
@@ -434,7 +466,7 @@ if [ "$PUBLIC_IP" = "$CONTAINER_IP" ]; then
 
         set_restart_policy "$RESTART_POLICY_LEAK"
 
-        if $DOCKER stop "$CONTAINER" >/dev/null 2>&1; then
+        if docker_run "$DOCKER_STOP_TIMEOUT" "stop" stop "$CONTAINER" >/dev/null 2>&1; then
             log "Container $CONTAINER stopped due to IP leak"
         else
             log "Warning: failed to stop container $CONTAINER after leak detection"

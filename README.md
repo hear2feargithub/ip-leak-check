@@ -98,6 +98,8 @@ All variables can be set as environment variables before the script runs. Each f
 | `MAXSIZE` | `1048576` | Log rotation threshold (1 MB) |
 | `RUNLOCK_MAX_AGE` | `120` | Seconds after which the run-lock is broken unconditionally, whatever holds the PID |
 | `DOCKER_EXEC_TIMEOUT` | `15` | Hard cap in seconds on any single `docker exec` |
+| `DOCKER_TIMEOUT` | `15` | Hard cap in seconds on `docker inspect` / `update` / `start` |
+| `DOCKER_STOP_TIMEOUT` | `30` | Hard cap in seconds on `docker stop` (it has its own 10s SIGTERM grace) |
 | `TIMEOUT_BIN` | `/usr/bin/timeout` | Path to `timeout` (not on `PATH` under cron on DSM) |
 | `DEADMAN_MAX_AGE` | `300` | Alert if the log stops advancing for this many seconds (`0` disables) |
 | `DEADMAN_REPEAT` | `1800` | Minimum seconds between repeat dead-man alerts |
@@ -201,6 +203,21 @@ bash /path/to/transmission/ip-leak-check.sh
 ```
 
 ## Changelog
+
+### v2.3 (2026-09-01)
+- **Every docker call is now bounded, not just `docker exec`.** `inspect`, `update`,
+  `start` and `stop` block on an unresponsive dockerd exactly the way `exec` does, so
+  bounding only `exec` left the same hang available through six other call sites — and
+  the very first thing the script does is a `docker inspect`.
+- All docker invocations route through a single `docker_run` helper, so a timeout is
+  **logged** (`docker inspect(Running) timed out after 15s`) instead of silently looking
+  like "container absent". The warning goes to stderr so it can never contaminate a
+  captured stdout value such as `$RUNNING`.
+- `docker stop` gets its own longer budget (`DOCKER_STOP_TIMEOUT`, 30s) because it has a
+  10s SIGTERM grace of its own; sharing the 15s control-plane cap would have produced
+  false "failed to stop container" warnings on a perfectly normal stop.
+- If `TIMEOUT_BIN` is missing, the script logs a warning and runs docker unbounded rather
+  than failing every docker call — previously only the two `exec` calls depended on it.
 
 ### v2.2 (2026-09-01)
 - **Run-lock no longer deadlocks on PID reuse.** `kill -0` on a bare PID only proves
