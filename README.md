@@ -96,6 +96,13 @@ All variables can be set as environment variables before the script runs. Each f
 | `MAX_RESTARTS_PER_WINDOW` | `3` | Max restart attempts per window |
 | `FULL_CHECK_INTERVAL` | `60` | Seconds between external IP checks |
 | `MAXSIZE` | `1048576` | Log rotation threshold (1 MB) |
+| `RUNLOCK_MAX_AGE` | `120` | Seconds after which the run-lock is broken unconditionally, whatever holds the PID |
+| `DOCKER_EXEC_TIMEOUT` | `15` | Hard cap in seconds on any single `docker exec` |
+| `TIMEOUT_BIN` | `/usr/bin/timeout` | Path to `timeout` (not on `PATH` under cron on DSM) |
+| `DEADMAN_MAX_AGE` | `300` | Alert if the log stops advancing for this many seconds (`0` disables) |
+| `DEADMAN_REPEAT` | `1800` | Minimum seconds between repeat dead-man alerts |
+| `GOTIFY_URL` | _(unset)_ | Gotify base URL, e.g. `http://localhost:8090` — omit to disable push |
+| `GOTIFY_APP_TOKEN` | _(unset)_ | Gotify application token |
 
 Set env vars inline in the cron entry (see Installation) or export them from a config file sourced before the script.
 
@@ -126,6 +133,33 @@ Each file contains:
 Fields: `reason`, `host_ip`, `container_ip`, `ts` (ISO 8601), `note`.
 
 If `MARKER_DIR` is not set, no marker files are written and Gotify integration is fully disabled.
+
+### Dead-man's switch
+
+Marker files only get written when the script is *running*. A watchdog that has
+stopped running cannot report its own death — in September 2026 this script sat
+wedged on a stale run-lock for 15 hours with leak protection off and never sent a
+single alert, because the process that sends alerts was the one that had died.
+
+The dead-man's switch closes that gap. On every invocation, before any logic that
+can exit early, it compares the age of `ip-leak.log` against `DEADMAN_MAX_AGE`
+(default 300s). A healthy watchdog appends a line at least once per
+`FULL_CHECK_INTERVAL`, so a log that has not advanced in five minutes means the
+checks are not happening.
+
+When it trips, the switch writes a warning to the log and — if `GOTIFY_URL` and
+`GOTIFY_APP_TOKEN` are both set — pushes a high-priority Gotify message. Repeat
+alerts are throttled to one per `DEADMAN_REPEAT` (default 30 min), and the reported
+outage is measured from when the stall began, not from the last alert.
+
+```
+GOTIFY_URL=http://localhost:8090
+GOTIFY_APP_TOKEN=your-app-token
+```
+
+Leave both unset to keep the log warning without the push. Note this covers a
+script that runs but cannot check; it cannot cover cron itself being stopped,
+since nothing in the script runs in that case.
 
 ## Log files
 
@@ -167,6 +201,27 @@ bash /path/to/transmission/ip-leak-check.sh
 ```
 
 ## Changelog
+
+### v2.2 (2026-09-01)
+- **Run-lock no longer deadlocks on PID reuse.** `kill -0` on a bare PID only proves
+  *something* holds that PID, not that it is this script. Over a long stall the PID was
+  reused by an unrelated live process, so the staleness check kept succeeding and the
+  lock was never broken — self-healing logic became a permanent deadlock (silently dead
+  for 15h on 2026-09-01, with leak protection off the whole time).
+  The lock is now broken unconditionally once it is older than `RUNLOCK_MAX_AGE`
+  (default 120s), which is the only guard that survives PID reuse.
+- **PID identity is verified before a live PID is trusted**, via `/proc/<pid>/cmdline`.
+  A live PID that is not this script no longer holds the lock.
+- **Every `docker exec` is bounded by `timeout`** (`DOCKER_EXEC_TIMEOUT`, default 15s).
+  `curl --max-time` bounds only the inner curl; `docker exec` itself hangs indefinitely
+  against an unresponsive dockerd, which is what stranded the lock in the first place.
+  A timed-out tunnel check fails closed (container stopped), the safe direction.
+- **Added a dead-man's switch**: if `ip-leak.log` stops advancing for `DEADMAN_MAX_AGE`
+  (default 300s), the script logs a warning and pushes a high-priority Gotify alert when
+  `GOTIFY_URL` / `GOTIFY_APP_TOKEN` are set. A dead watchdog previously failed silently,
+  because the script that raises alerts was the script that had died.
+- Run-lock breaks are now logged rather than silent, so the condition is visible in
+  `ip-leak.log` instead of only inferable from missing output.
 
 ### v2.1 (2026-05-22)
 - Gotify marker output is now optional — set `MARKER_DIR` env var to enable, omit to disable

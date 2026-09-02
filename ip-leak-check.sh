@@ -8,6 +8,9 @@
 # On recovery: re-enables Docker restart policy before starting container.
 # Auto-restarts after cooldown, only if host internet is healthy.
 # Caps restart attempts per hour and writes separate last-leak / last-restart markers.
+# v2.2: run-lock breaks on mtime age (the only guard that survives PID reuse) and
+#       verifies PID identity via /proc/<pid>/cmdline; every docker exec is bounded
+#       by timeout; dead-man's switch alerts if ip-leak.log stops advancing.
 
 CONTAINER="${CONTAINER:?Error: CONTAINER env var must be set}"
 DOCKER="${DOCKER:-/usr/local/bin/docker}"
@@ -33,6 +36,18 @@ MAX_RESTARTS_PER_WINDOW="${MAX_RESTARTS_PER_WINDOW:-3}"  # max restart attempts 
 MAXSIZE="${MAXSIZE:-1048576}"                     # 1 MB
 FULL_CHECK_INTERVAL="${FULL_CHECK_INTERVAL:-60}"  # seconds between external IP checks
 LAST_FULL_CHECK_FILE="/tmp/${CONTAINER}.last-full-check"
+
+RUNLOCK_MAX_AGE="${RUNLOCK_MAX_AGE:-120}"         # break the run-lock unconditionally past this age
+DOCKER_EXEC_TIMEOUT="${DOCKER_EXEC_TIMEOUT:-15}"  # hard cap on any single docker exec
+TIMEOUT_BIN="${TIMEOUT_BIN:-/usr/bin/timeout}"    # not on PATH under cron on DSM
+
+DEADMAN_MAX_AGE="${DEADMAN_MAX_AGE:-300}"         # alert if the log stops advancing for this long (0 disables)
+DEADMAN_REPEAT="${DEADMAN_REPEAT:-1800}"          # re-alert at most this often while still stalled
+DEADMAN_STAMP="/tmp/${CONTAINER}.deadman.last"    # last alert time
+DEADMAN_STALL_FILE="/tmp/${CONTAINER}.deadman.stall"  # log mtime when the stall was first seen
+
+GOTIFY_URL="${GOTIFY_URL:-}"                      # e.g. http://localhost:8090; empty disables push
+GOTIFY_APP_TOKEN="${GOTIFY_APP_TOKEN:-}"
 
 RESTART_POLICY_SAFE="unless-stopped"
 RESTART_POLICY_LEAK="no"
@@ -131,12 +146,94 @@ set_restart_policy() {
     $DOCKER update --restart "$policy" "$CONTAINER" >/dev/null 2>&1
 }
 
+gotify_push() {   # gotify_push <title> <priority> <message>
+    [ -n "$GOTIFY_URL" ] && [ -n "$GOTIFY_APP_TOKEN" ] || return 0
+    curl -s -o /dev/null --max-time 10 \
+        -H "X-Gotify-Key: $GOTIFY_APP_TOKEN" \
+        -F "title=$1" \
+        -F "priority=$2" \
+        -F "message=$3" \
+        "$GOTIFY_URL/message" 2>/dev/null
+}
+
+file_age() {   # file_age <path> -> seconds since mtime; non-zero if unreadable
+    local mtime now
+    mtime="$(stat -c %Y "$1" 2>/dev/null)"
+    [ -n "$mtime" ] || return 1
+    now="$(date +%s)"
+    echo $((now - mtime))
+}
+
+# Dead-man's switch: a dead watchdog cannot alert about itself, so check log
+# freshness before anything that can exit early. The 2026-09-01 wedge was
+# exactly this shape -- cron kept firing, every run returned 0 at the run-lock,
+# and nothing logged for 15h without a single alert.
+deadman_check() {
+    [ "$DEADMAN_MAX_AGE" -gt 0 ] 2>/dev/null || return 0
+    [ -f "$LOGFILE" ] || return 0
+
+    local age now stall_mtime stalled_for last
+    age="$(file_age "$LOGFILE")" || return 0
+    [ "$age" -ge "$DEADMAN_MAX_AGE" ] || return 0
+
+    now="$(date +%s)"
+
+    # Remember when the stall started. The alert line logged below refreshes the
+    # log mtime, so without this the reported outage would reset on every alert.
+    stall_mtime=""
+    [ -f "$DEADMAN_STALL_FILE" ] && stall_mtime="$(cat "$DEADMAN_STALL_FILE" 2>/dev/null)"
+    case "$stall_mtime" in
+        ''|*[!0-9]*)
+            stall_mtime=$((now - age))
+            echo "$stall_mtime" > "$DEADMAN_STALL_FILE"
+            ;;
+    esac
+    stalled_for=$((now - stall_mtime))
+
+    # Throttle so a long outage does not spam.
+    last=0
+    [ -f "$DEADMAN_STAMP" ] && last="$(cat "$DEADMAN_STAMP" 2>/dev/null)"
+    case "$last" in ''|*[!0-9]*) last=0 ;; esac
+    [ $((now - last)) -ge "$DEADMAN_REPEAT" ] || return 0
+
+    echo "$now" > "$DEADMAN_STAMP"
+    log "Warning: dead-man's switch fired -- no new log line for ${stalled_for}s"
+    gotify_push "IP leak watchdog stalled" 8 \
+        "$(hostname): $LOGFILE has not advanced in $((stalled_for / 60))m. The leak check is not running, so VPN leak protection for $CONTAINER may be OFF."
+}
+
+deadman_check
+
 # --- run-lock: exit if another instance is already running ---
+# kill -0 alone is NOT sufficient: across a long stall the recorded PID gets
+# reused by an unrelated live process, the liveness check keeps succeeding, and
+# the lock is never broken (2026-09-01: silently dead for 15h). Two guards
+# below -- an absolute mtime bound, and PID identity via /proc.
+
+SCRIPT_NAME="$(basename "$0")"
+
+runlock_held_by_this_script() {   # runlock_held_by_this_script <pid>
+    local pid="$1"
+    [ -n "$pid" ] || return 1
+    case "$pid" in *[!0-9]*) return 1 ;; esac
+    kill -0 "$pid" 2>/dev/null || return 1
+    tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -qF "$SCRIPT_NAME"
+}
+
 if ! ( set -C; echo $$ > "$RUNLOCK" ) 2>/dev/null; then
     OLD_PID="$(cat "$RUNLOCK" 2>/dev/null)"
-    if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+    RUNLOCK_AGE="$(file_age "$RUNLOCK")" || RUNLOCK_AGE="$RUNLOCK_MAX_AGE"
+
+    if [ "$RUNLOCK_AGE" -ge "$RUNLOCK_MAX_AGE" ]; then
+        # The only guard that survives PID reuse. Past this age the lock is stale
+        # whatever holds the PID; brief overlap beats a permanent deadlock.
+        log "Warning: breaking stale run-lock (age ${RUNLOCK_AGE}s >= ${RUNLOCK_MAX_AGE}s, pid '${OLD_PID:-none}')"
+    elif runlock_held_by_this_script "$OLD_PID"; then
         exit 0
+    else
+        log "Warning: breaking orphaned run-lock (pid '${OLD_PID:-none}' is not a live $SCRIPT_NAME)"
     fi
+
     rm -f "$RUNLOCK"
     ( set -C; echo $$ > "$RUNLOCK" ) 2>/dev/null || exit 0
 fi
@@ -247,7 +344,9 @@ if [ -n "$UPTIME" ]; then
 fi
 
 # --- fast check: VPN tunnel interface (every 10s) ---
-if ! $DOCKER exec "$CONTAINER" ip link show tun0 2>/dev/null | grep -q "UP"; then
+# A timeout here is treated as "tunnel not verifiable" and so fails closed
+# (container stopped), which is the safe direction for a leak guard.
+if ! $TIMEOUT_BIN "$DOCKER_EXEC_TIMEOUT" $DOCKER exec "$CONTAINER" ip link show tun0 2>/dev/null | grep -q "UP"; then
     if ( set -C; : > "$LOCKFILE" ) 2>/dev/null; then
         log "VPN tunnel down (tun0 not UP); stopping container $CONTAINER"
 
@@ -294,7 +393,9 @@ fi
 echo "$NOWSEC" > "$LAST_FULL_CHECK_FILE"
 
 PUBLIC_IP="$(curl -s --max-time 5 --retry 2 ifconfig.me 2>/dev/null)"
-CONTAINER_IP="$($DOCKER exec "$CONTAINER" curl -s --max-time 10 --retry 2 ifconfig.me 2>/dev/null)"
+# curl --max-time bounds the inner curl only; docker exec itself can hang
+# indefinitely on an unresponsive dockerd, which is what stranded the run-lock.
+CONTAINER_IP="$($TIMEOUT_BIN "$DOCKER_EXEC_TIMEOUT" $DOCKER exec "$CONTAINER" curl -s --max-time 10 --retry 2 ifconfig.me 2>/dev/null)"
 
 if [ -z "$PUBLIC_IP" ] || [ -z "$CONTAINER_IP" ]; then
     log "Warning: IP check skipped (blank response)"
@@ -351,6 +452,8 @@ else
     [ -f "$RESTARTSTAMP" ] && rm -f "$RESTARTSTAMP"
     [ -f "$RESTARTCOUNTFILE" ] && rm -f "$RESTARTCOUNTFILE"
     [ -f "$RESTARTWINDOWFILE" ] && rm -f "$RESTARTWINDOWFILE"
+    [ -f "$DEADMAN_STALL_FILE" ] && rm -f "$DEADMAN_STALL_FILE"
+    [ -f "$DEADMAN_STAMP" ] && rm -f "$DEADMAN_STAMP"
 fi
 
 exit 0
