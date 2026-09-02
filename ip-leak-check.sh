@@ -13,6 +13,7 @@ CONTAINER="${CONTAINER:?Error: CONTAINER env var must be set}"
 DOCKER="${DOCKER:-/usr/local/bin/docker}"
 
 LOCKFILE="/tmp/ipcheck.lock"
+RUNLOCK="/tmp/ipcheck-running.lock"
 RESTARTSTAMP="/tmp/${CONTAINER}.restart.last"
 RESTARTCOUNTFILE="/tmp/${CONTAINER}.restart.count"
 RESTARTWINDOWFILE="/tmp/${CONTAINER}.restart.window"
@@ -129,6 +130,17 @@ set_restart_policy() {
     local policy="$1"
     $DOCKER update --restart "$policy" "$CONTAINER" >/dev/null 2>&1
 }
+
+# --- run-lock: exit if another instance is already running ---
+if ! ( set -C; echo $$ > "$RUNLOCK" ) 2>/dev/null; then
+    OLD_PID="$(cat "$RUNLOCK" 2>/dev/null)"
+    if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+        exit 0
+    fi
+    rm -f "$RUNLOCK"
+    ( set -C; echo $$ > "$RUNLOCK" ) 2>/dev/null || exit 0
+fi
+trap 'rm -f "$RUNLOCK"' EXIT INT TERM
 
 # --- start ---
 rotate_logs
