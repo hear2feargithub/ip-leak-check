@@ -139,8 +139,14 @@ be neutralised as well:
 
 ```bash
 sudo cp -a /etc/rc.local /etc/rc.local.bak
-sudo sed -i '/ip-leak/s/^/# /; /synosystemctl restart crond/s/^/# /' /etc/rc.local
+# Comment out every active line. Do NOT filter on "ip-leak": the line that does
+# the appending references $CRONLINE and does not contain that string, so a
+# /ip-leak/ match leaves it live. (The shebang is already a comment; exit 0
+# getting commented is harmless.)
+sudo sed -i 's/^[^#]/# &/' /etc/rc.local
 sudo sh -n /etc/rc.local && echo "syntax OK"
+# Confirm nothing active remains:
+sudo grep -vE '^[[:space:]]*(#|$)' /etc/rc.local
 ```
 
 This also explains why the duplicate appears in the middle of `/etc/crontab` rather
