@@ -79,7 +79,81 @@ ssh your_user@your-nas "chmod +x /path/to/transmission/ip-leak-check.sh"
 
 This runs the script every 10 seconds (6 times per minute). The fast `tun0` check fires on every run; the external IP check is throttled internally to once per minute.
 
-> **Note:** Do not add a log redirect (`>> logfile`) to the cron entry — the script handles its own logging internally via `tee`.
+> **Note:** Do not add a log redirect (`>> logfile`) to the cron entry — the script
+> handles its own logging internally via `tee`. This is not a style preference: a
+> redirect actively defeats the dead-man's switch. See below.
+
+### The cron entry is the single source of truth
+
+There must be **exactly one** ip-leak-check line in `/etc/crontab`, and it is the
+entry shown above — the one that exports `CONTAINER`/`LOGDIR`/`MARKER_DIR` and loops
+six times. Verify with:
+
+```bash
+sudo grep -c ip-leak-check /etc/crontab   # must print 1
+```
+
+Whitespace is not significant here: the working entry uses spaces rather than tabs
+and parses correctly. Do not "fix" it.
+
+#### The duplicate-line failure mode
+
+A second, simpler-looking entry has twice been added alongside the correct one:
+
+```
+# WRONG — never add this
+* * * * * root /path/to/ip-leak-check.sh >> /path/to/ip-leak.log 2>&1
+```
+
+It looks harmless. It is not. It sets no `CONTAINER`, so the script aborts at line 18
+with `CONTAINER: Error: CONTAINER env var must be set` — and because of `2>&1`, that
+error is written **into `ip-leak.log`**.
+
+That is the dangerous part. The [dead-man's switch](#dead-mans-switch) decides the
+watchdog is alive by testing the **age** of `ip-leak.log`. A broken duplicate entry
+refreshes the log's mtime every 60 seconds, so the log always looks fresh. If the real
+check then died, the switch would never fire. The duplicate does not merely add log
+noise — it silently disables the safety net that exists to catch total failure.
+
+#### Recurrence history
+
+| Date | Event |
+|---|---|
+| 2026-05-23 | Duplicate line found in `/etc/crontab` and removed. Root cause not identified at the time. |
+| 2026-09-07 | Reappeared after the DSM 7.2.2-72806 → 7.4.1-90080 upgrade. Root cause found: `/etc/rc.local`. |
+
+The 2026-09-07 recurrence was **not** restored from a crontab backup, and was not
+DSM's own scheduler. The source was `/etc/rc.local`:
+
+```sh
+CRONLINE="* * * * * root /path/to/ip-leak-check.sh >> /path/to/ip-leak.log 2>&1"
+grep -qF "$CRONLINE" /etc/crontab || echo "$CRONLINE" >> /etc/crontab
+```
+
+`/etc/rc.local` runs on **every boot** and re-appends the broken line whenever that
+exact string is absent. The 2026-05-23 fix removed the line from `/etc/crontab` but
+left `rc.local` in place, so the entry was always going to come back — the DSM upgrade
+was simply the first reboot in the three months since, not the cause. Removing the
+line from `/etc/crontab` alone is therefore **not** a durable fix; `/etc/rc.local` must
+be neutralised as well:
+
+```bash
+sudo cp -a /etc/rc.local /etc/rc.local.bak
+sudo sed -i '/ip-leak/s/^/# /; /synosystemctl restart crond/s/^/# /' /etc/rc.local
+sudo sh -n /etc/rc.local && echo "syntax OK"
+```
+
+This also explains why the duplicate appears in the middle of `/etc/crontab` rather
+than at the end: `rc.local` appends it at boot *before* DSM's scheduler regenerates
+its own `synoschedtask` block underneath it.
+
+> **Searching for stray entries:** on Synology, `/etc/rc.local` survives DSM upgrades
+> and is root-owned `0700`, so it is invisible to an unprivileged `grep`. Always search
+> with `sudo`, or you will conclude the crontab is the only source:
+>
+> ```bash
+> sudo grep -rl ip-leak /etc /etc.defaults /usr/syno/etc /var/packages
+> ```
 
 ## Configuration
 
@@ -162,6 +236,11 @@ GOTIFY_APP_TOKEN=your-app-token
 Leave both unset to keep the log warning without the push. Note this covers a
 script that runs but cannot check; it cannot cover cron itself being stopped,
 since nothing in the script runs in that case.
+
+It also depends on `ip-leak.log` being touched *only* by this script. Anything else
+that appends to that file — most easily a stray second cron entry with a `>> ip-leak.log`
+redirect — keeps the mtime fresh and blinds the switch completely. See
+[The cron entry is the single source of truth](#the-cron-entry-is-the-single-source-of-truth).
 
 ## Log files
 
