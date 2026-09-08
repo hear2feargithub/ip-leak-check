@@ -185,6 +185,7 @@ All variables can be set as environment variables before the script runs. Each f
 | `DEADMAN_REPEAT` | `1800` | Minimum seconds between repeat dead-man alerts |
 | `GOTIFY_URL` | _(unset)_ | Gotify base URL, e.g. `http://localhost:8090` — omit to disable push |
 | `GOTIFY_APP_TOKEN` | _(unset)_ | Gotify application token |
+| `NOTIFY_LIB` | _(unset)_ | Path to a shared `notify.sh` exposing `notify()` / `notify_resolve()` — omit to disable |
 
 Set env vars inline in the cron entry (see Installation) or export them from a config file sourced before the script.
 
@@ -204,7 +205,7 @@ MARKER_DIR=/path/to/gotify/markers
 |---|---|
 | `$CONTAINER.last-leak.json` | IP leak or tun0-down detected |
 | `$CONTAINER.last-restart.json` | Restart attempted (any reason) |
-| `$CONTAINER.reason.json` | Container stopped due to leak |
+| ~~`$CONTAINER.reason.json`~~ | **No longer written** — see below |
 
 Each file contains:
 
@@ -214,7 +215,31 @@ Each file contains:
 
 Fields: `reason`, `host_ip`, `container_ip`, `ts` (ISO 8601), `note`.
 
-If `MARKER_DIR` is not set, no marker files are written and Gotify integration is fully disabled.
+If `MARKER_DIR` is not set, no marker files are written and marker output is fully disabled.
+
+### Direct alerting (`NOTIFY_LIB`)
+
+Point `NOTIFY_LIB` at a shell library exposing `notify <SEVERITY> <key> <title> <body>` and
+`notify_resolve <key> <title> <body>` and the watchdog alerts through it directly. Both are
+optional and independent of Gotify; with neither configured the script logs and stays silent.
+
+Alerts are raised for: leak detected, tun0 down, restart failed, restart suppressed, and the
+dead-man's switch — with matching recovery messages when the condition clears. Bodies are
+deliberately terse and carry no addresses; the IPs stay in the log.
+
+**`reason.json` was removed in favour of this.** It existed only to signal an external
+`docker events` watcher, which turned the marker into the actual leak notification — a
+three-hop chain (script writes marker → container stops → watcher reads marker) in which any
+broken link lost the alert silently, with nothing reporting the loss.
+
+Dropping it has a second benefit: an external watcher that sees a container stop with **no**
+marker correctly reads it as an intentional stop and stays quiet, so one event produces one
+notification even while both systems are running. `last-leak.json` and `last-restart.json`
+remain — they are state records for inspection, not signals to anything.
+
+> **Known limitation:** `LOCKFILE` and `RUNLOCK` are fixed paths (`/tmp/ipcheck.lock`,
+> `/tmp/ipcheck-running.lock`) while other state is namespaced by `$CONTAINER`. Two instances
+> guarding different containers therefore share one lock and will interfere.
 
 ### Dead-man's switch
 
@@ -229,8 +254,17 @@ can exit early, it compares the age of `ip-leak.log` against `DEADMAN_MAX_AGE`
 `FULL_CHECK_INTERVAL`, so a log that has not advanced in five minutes means the
 checks are not happening.
 
-When it trips, the switch writes a warning to the log and — if `GOTIFY_URL` and
-`GOTIFY_APP_TOKEN` are both set — pushes a high-priority Gotify message. Repeat
+When it trips, the switch writes a warning to the log and raises a `CRIT` alert through
+`NOTIFY_LIB` and/or a high-priority Gotify message, depending on which is configured.
+
+> **This was silently inert in production until 2026-09-07.** The switch detected stalls
+> correctly, but `gotify_push` returns early unless `GOTIFY_URL` and `GOTIFY_APP_TOKEN` are
+> set, and the cron entry exported neither — so a dead watchdog stayed undetected, which is
+> precisely the failure the switch exists to catch. **If you run this from cron, verify the
+> notification variables are actually exported in the cron entry itself**; cron does not
+> inherit your shell environment.
+
+Repeat
 alerts are throttled to one per `DEADMAN_REPEAT` (default 30 min), and the reported
 outage is measured from when the stall began, not from the last alert.
 

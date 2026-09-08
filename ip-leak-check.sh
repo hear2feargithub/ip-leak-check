@@ -30,7 +30,13 @@ LOGFILE="$LOGDIR/ip-leak.log"
 MARKER_DIR="${MARKER_DIR:-}"  # optional: set to write Gotify JSON marker files
 LAST_LEAK_FILE="$MARKER_DIR/$CONTAINER.last-leak.json"
 LAST_RESTART_FILE="$MARKER_DIR/$CONTAINER.last-restart.json"
-REASON_FILE="$MARKER_DIR/$CONTAINER.reason.json"
+# NOTE: $CONTAINER.reason.json is no longer written. It existed purely to signal
+# an external docker-events watcher, which turned the marker into the leak alert.
+# This script now alerts directly via alert(), so writing the marker as well
+# would produce two notifications for one event. Dropping it also means an
+# external watcher sees a stop with no marker and correctly treats it as
+# intentional. $LAST_LEAK_FILE / $LAST_RESTART_FILE remain -- they are state
+# records for inspection, not signals to anything.
 
 GRACE_SECONDS="${GRACE_SECONDS:-120}"
 RESTART_COOLDOWN="${RESTART_COOLDOWN:-300}"       # 5 minutes between restart attempts
@@ -53,6 +59,12 @@ DEADMAN_STALL_FILE="/tmp/${CONTAINER}.deadman.stall"  # log mtime when the stall
 
 GOTIFY_URL="${GOTIFY_URL:-}"                      # e.g. http://localhost:8090; empty disables push
 GOTIFY_APP_TOKEN="${GOTIFY_APP_TOKEN:-}"
+
+# Path to a shared notify.sh providing notify()/notify_resolve() (see the
+# companion `notify` project). Empty leaves this script standalone, logging only.
+# Set it from the environment -- under cron that means an explicit export, which
+# is exactly what silently disabled the dead-man alert before.
+NOTIFY_LIB="${NOTIFY_LIB:-}"
 
 RESTART_POLICY_SAFE="unless-stopped"
 RESTART_POLICY_LEAK="no"
@@ -181,6 +193,42 @@ gotify_push() {   # gotify_push <title> <priority> <message>
         "$GOTIFY_URL/message" 2>/dev/null
 }
 
+# Load the shared notifier if one was configured. Sourcing is deliberately NOT
+# done with a `VAR=x . lib` prefix: bash discards such an assignment when the
+# source returns, leaving the variable unset at call time.
+NOTIFY_READY=0
+if [ -n "$NOTIFY_LIB" ] && [ -r "$NOTIFY_LIB" ]; then
+    # shellcheck source=/dev/null
+    if . "$NOTIFY_LIB" 2>/dev/null; then
+        command -v notify >/dev/null 2>&1 && NOTIFY_READY=1
+    fi
+fi
+
+gotify_priority_for() {
+    case "$1" in
+        CRIT) echo 8 ;;
+        HIGH) echo 7 ;;
+        LOW)  echo 5 ;;
+        *)    echo 3 ;;
+    esac
+}
+
+# alert <severity> <key> <title> <message>
+# Fans out to whichever notifiers are configured, and NEVER fails the caller --
+# a watchdog that cannot report must still keep guarding.
+alert() {
+    [ "$NOTIFY_READY" = "1" ] && notify "$1" "$2" "$3" "$4"
+    gotify_push "$3" "$(gotify_priority_for "$1")" "$4"
+    return 0
+}
+
+# alert_clear <key> <title> <message>
+# Silent unless that key had actually alerted, so healthy runs stay quiet.
+alert_clear() {
+    [ "$NOTIFY_READY" = "1" ] && notify_resolve "$1" "$2" "$3"
+    return 0
+}
+
 file_age() {   # file_age <path> -> seconds since mtime; non-zero if unreadable
     local mtime now
     mtime="$(stat -c %Y "$1" 2>/dev/null)"
@@ -223,8 +271,9 @@ deadman_check() {
 
     echo "$now" > "$DEADMAN_STAMP"
     log "Warning: dead-man's switch fired -- no new log line for ${stalled_for}s"
-    gotify_push "IP leak watchdog stalled" 8 \
-        "$(hostname): $LOGFILE has not advanced in $((stalled_for / 60))m. The leak check is not running, so VPN leak protection for $CONTAINER may be OFF."
+    alert CRIT "ipleak-deadman:$CONTAINER" "Leak watchdog stalled" \
+        "No log activity for $((stalled_for / 60))m, so the leak check is not running and VPN leak protection for $CONTAINER may be OFF.
+Check: $LOGFILE"
 }
 
 if [ ! -x "$TIMEOUT_BIN" ]; then
@@ -298,6 +347,9 @@ if [ "$RUNNING" != "true" ]; then
         if [ "$RESTART_COUNT" -ge "$MAX_RESTARTS_PER_WINDOW" ]; then
             log "Container $CONTAINER restart suppressed: reached $RESTART_COUNT attempts in current ${RESTART_WINDOW}s window"
             write_json_marker "$LAST_RESTART_FILE" "restart_suppressed" "" "" "max restart attempts reached"
+            alert HIGH "ipleak-restart:$CONTAINER" "Container restart suppressed" \
+                "$CONTAINER hit the restart limit ($MAX_RESTARTS_PER_WINDOW per $((RESTART_WINDOW / 60))m) after a leak stop and will stay down until the window clears.
+Check: $LOGFILE"
             exit 0
         fi
 
@@ -321,9 +373,14 @@ if [ "$RUNNING" != "true" ]; then
         if docker_run "$DOCKER_TIMEOUT" "start" start "$CONTAINER" >/dev/null 2>&1; then
             log "Container $CONTAINER started successfully; startup grace period will apply"
             write_json_marker "$LAST_RESTART_FILE" "restart_succeeded" "" "" "container started successfully after leak event"
+            alert_clear "ipleak-restart:$CONTAINER" "Container restarted" \
+                "$CONTAINER started again after a leak stop."
         else
             log "Warning: automatic restart attempt failed for $CONTAINER"
             write_json_marker "$LAST_RESTART_FILE" "restart_failed" "" "" "docker start failed after leak event"
+            alert CRIT "ipleak-restart:$CONTAINER" "Container restart failed" \
+                "$CONTAINER is stopped after a leak event and the automatic restart failed. Manual action needed.
+Check: $LOGFILE"
         fi
 
         exit 0
@@ -343,6 +400,9 @@ if [ "$RUNNING" != "true" ]; then
     if [ "$RESTART_COUNT" -ge "$MAX_RESTARTS_PER_WINDOW" ]; then
         log "Warning: container $CONTAINER is not running; unexpected-stop restart suppressed after $RESTART_COUNT attempts in current ${RESTART_WINDOW}s window"
         write_json_marker "$LAST_RESTART_FILE" "restart_suppressed" "" "" "unexpected stop; max restart attempts reached"
+        alert HIGH "ipleak-restart:$CONTAINER" "Container restart suppressed" \
+            "$CONTAINER stopped unexpectedly and hit the restart limit ($MAX_RESTARTS_PER_WINDOW per $((RESTART_WINDOW / 60))m). It will stay down until the window clears.
+Check: $LOGFILE"
         exit 0
     fi
 
@@ -355,9 +415,14 @@ if [ "$RUNNING" != "true" ]; then
     if docker_run "$DOCKER_TIMEOUT" "start" start "$CONTAINER" >/dev/null 2>&1; then
         log "Container $CONTAINER started successfully after unexpected stop; startup grace period will apply"
         write_json_marker "$LAST_RESTART_FILE" "restart_unexpected_stop" "" "" "container restarted after unexpected stop"
+        alert_clear "ipleak-restart:$CONTAINER" "Container restarted" \
+            "$CONTAINER started again after an unexpected stop."
     else
         log "Warning: automatic restart after unexpected stop failed for $CONTAINER"
         write_json_marker "$LAST_RESTART_FILE" "restart_failed" "" "" "unexpected stop; docker start failed"
+        alert CRIT "ipleak-restart:$CONTAINER" "Container restart failed" \
+            "$CONTAINER stopped unexpectedly and the automatic restart failed. Manual action needed.
+Check: $LOGFILE"
     fi
 
     exit 0
@@ -382,12 +447,9 @@ if ! docker_run "$DOCKER_EXEC_TIMEOUT" "exec(ip link tun0)" exec "$CONTAINER" ip
     if ( set -C; : > "$LOCKFILE" ) 2>/dev/null; then
         log "VPN tunnel down (tun0 not UP); stopping container $CONTAINER"
 
-        write_json_marker \
-            "$REASON_FILE" \
-            "tun0_down" \
-            "" \
-            "" \
-            "container stopped due to VPN tunnel down"
+        alert CRIT "ipleak-tun0:$CONTAINER" "VPN tunnel down - container stopped" \
+            "$CONTAINER was stopped because tun0 was not UP. It stays down until the tunnel is healthy again.
+Check: $LOGFILE"
 
         write_json_marker \
             "$LAST_LEAK_FILE" \
@@ -450,12 +512,11 @@ if [ "$PUBLIC_IP" = "$CONTAINER_IP" ]; then
     if ( set -C; : > "$LOCKFILE" ) 2>/dev/null; then
         log "IP leak detected! Host=$PUBLIC_IP, Container=$CONTAINER_IP"
 
-        write_json_marker \
-            "$REASON_FILE" \
-            "ip_leak" \
-            "$PUBLIC_IP" \
-            "$CONTAINER_IP" \
-            "container stopped due to IP leak"
+        # Deliberately terse: the addresses stay in the log, not in a message
+        # that lands on a third party's servers.
+        alert CRIT "ipleak-ip:$CONTAINER" "IP leak - container stopped" \
+            "$CONTAINER reported the same external IP as the host, so it was stopped to prevent exposure.
+Check: $LOGFILE"
 
         write_json_marker \
             "$LAST_LEAK_FILE" \
@@ -480,6 +541,17 @@ if [ "$PUBLIC_IP" = "$CONTAINER_IP" ]; then
     fi
 else
     log "OK (Host=$PUBLIC_IP, Container=$CONTAINER_IP)"
+
+    # Each of these is silent unless that key had actually alerted, so a healthy
+    # run stays quiet. This is the only branch where the tunnel is confirmed
+    # good AND the addresses differ, so it is the only honest place to clear.
+    alert_clear "ipleak-ip:$CONTAINER" "IP leak cleared" \
+        "$CONTAINER external IP differs from the host again."
+    alert_clear "ipleak-tun0:$CONTAINER" "VPN tunnel recovered" \
+        "tun0 is UP and $CONTAINER is checking clean."
+    alert_clear "ipleak-deadman:$CONTAINER" "Leak watchdog running again" \
+        "The leak check is logging normally; VPN leak protection is active."
+
     [ -f "$LOCKFILE" ] && rm -f "$LOCKFILE"
     [ -f "$RESTARTSTAMP" ] && rm -f "$RESTARTSTAMP"
     [ -f "$RESTARTCOUNTFILE" ] && rm -f "$RESTARTCOUNTFILE"
