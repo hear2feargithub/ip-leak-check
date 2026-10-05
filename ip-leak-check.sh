@@ -14,6 +14,15 @@
 # v2.3: every docker call is bounded, not just exec -- inspect/update/start/stop can
 #       hang on a wedged dockerd too. Stop gets a longer budget than control-plane
 #       calls because it has its own SIGTERM grace. Timeouts are logged.
+# v2.4: one incident, two messages. Stops, failed restarts and restart limits
+#       join a single incident (key ipleak:<container>): one HIGH message when
+#       it opens, one recovery after RECOVERY_HOLD of clean checks, and one CRIT
+#       only if the container stays down ESCALATE_AFTER without a break. A
+#       timed-out tun0 check needs TUN_TIMEOUT_STRIKES in a row before it stops
+#       the container and is reported as "dockerd unresponsive", not "tunnel
+#       down". A timed-out inspect skips the run instead of attempting a restart.
+#       An actual IP match stays its own CRIT alert. (2026-10-05: one Hyper
+#       Backup run produced 10 Telegram messages under v2.3.)
 
 CONTAINER="${CONTAINER:?Error: CONTAINER env var must be set}"
 DOCKER="${DOCKER:-/usr/local/bin/docker}"
@@ -56,6 +65,13 @@ DEADMAN_MAX_AGE="${DEADMAN_MAX_AGE:-300}"         # alert if the log stops advan
 DEADMAN_REPEAT="${DEADMAN_REPEAT:-1800}"          # re-alert at most this often while still stalled
 DEADMAN_STAMP="/tmp/${CONTAINER}.deadman.last"    # last alert time
 DEADMAN_STALL_FILE="/tmp/${CONTAINER}.deadman.stall"  # log mtime when the stall was first seen
+
+RECOVERY_HOLD="${RECOVERY_HOLD:-600}"             # clean checks needed before an incident is called recovered
+ESCALATE_AFTER="${ESCALATE_AFTER:-1800}"          # CRIT once if the container stays down this long without a break
+TUN_TIMEOUT_STRIKES="${TUN_TIMEOUT_STRIKES:-2}"   # consecutive tun0-check timeouts before a precautionary stop
+TUN_STRIKE_WINDOW="${TUN_STRIKE_WINDOW:-60}"      # a strike older than this no longer counts as consecutive
+INCIDENT_FILE="/tmp/${CONTAINER}.incident"        # start|cycles|down_since|clean_since|escalated|cause
+TUN_STRIKE_FILE="/tmp/${CONTAINER}.tun0-timeouts" # count|last
 
 GOTIFY_URL="${GOTIFY_URL:-}"                      # e.g. http://localhost:8090; empty disables push
 GOTIFY_APP_TOKEN="${GOTIFY_APP_TOKEN:-}"
@@ -229,6 +245,97 @@ alert_clear() {
     return 0
 }
 
+fmt_dur() {   # fmt_dur <seconds> -> "47m" / "2h05m"
+    local s="$1"
+    [ "$s" -ge 3600 ] && printf '%dh%02dm' $((s / 3600)) $((s % 3600 / 60)) || printf '%dm' $(((s + 59) / 60))
+}
+
+# --- incident: one open message, one recovery, one escalation at most --------
+# Everything that takes the container down (a precautionary or tun0 stop, a
+# failed restart, the restart limit) joins ONE incident. v2.3 alerted on each of
+# those separately, and every recovery message re-armed the next alert, so a
+# dockerd stall that flapped the container three times sent ten messages.
+INC_START=0 INC_CYCLES=0 INC_DOWN=0 INC_CLEAN=0 INC_ESC=0 INC_CAUSE=""
+
+incident_load() {
+    INC_START=0 INC_CYCLES=0 INC_DOWN=0 INC_CLEAN=0 INC_ESC=0 INC_CAUSE=""
+    [ -f "$INCIDENT_FILE" ] || return 1
+    IFS='|' read -r INC_START INC_CYCLES INC_DOWN INC_CLEAN INC_ESC INC_CAUSE < "$INCIDENT_FILE" 2>/dev/null
+    case "$INC_START" in ''|*[!0-9]*) INC_START=0; return 1 ;; esac
+    for v in INC_CYCLES INC_DOWN INC_CLEAN INC_ESC; do
+        case "${!v}" in ''|*[!0-9]*) printf -v "$v" 0 ;; esac
+    done
+    return 0
+}
+
+incident_save() {
+    printf '%s|%s|%s|%s|%s|%s\n' "$INC_START" "$INC_CYCLES" "$INC_DOWN" "$INC_CLEAN" "$INC_ESC" "$INC_CAUSE" > "$INCIDENT_FILE"
+}
+
+# incident_event <stopped:0|1> <notify:0|1> <cause>
+# stopped=1 means the container is down as of now. notify=0 opens the incident
+# silently (an IP match already sent its own CRIT, so its restart churn must not
+# add a second message).
+incident_event() {
+    local stopped="$1" notify_open="$2" cause="${3//|//}" now
+    now="$(date +%s)"
+    if incident_load; then
+        [ "$stopped" = "1" ] && [ "$INC_DOWN" -eq 0 ] && { INC_CYCLES=$((INC_CYCLES + 1)); INC_DOWN="$now"; }
+        INC_CLEAN=0
+        incident_save
+        return 0
+    fi
+    INC_START="$now" INC_CYCLES=0 INC_DOWN=0 INC_CLEAN=0 INC_ESC=0 INC_CAUSE="$cause"
+    [ "$stopped" = "1" ] && { INC_CYCLES=1; INC_DOWN="$now"; }
+    incident_save
+    # The incident does its own dedupe, so the notifier's cooldown must not
+    # swallow an open that follows a recovery inside its window.
+    [ "$notify_open" = "1" ] && NOTIFY_COOLDOWN=0 alert HIGH "ipleak:$CONTAINER" "$CONTAINER held stopped" \
+        "$cause
+Auto-restart is on. You get one more message when it has checked clean for $((RECOVERY_HOLD / 60))m, or if it stays down $((ESCALATE_AFTER / 60))m.
+Check: $LOGFILE"
+    return 0
+}
+
+incident_running() {   # the container is up: end the current down period
+    incident_load || return 0
+    [ "$INC_DOWN" -eq 0 ] && return 0
+    INC_DOWN=0
+    incident_save
+}
+
+incident_escalate_if_stuck() {   # called while the container is stopped
+    incident_load || return 0
+    [ "$INC_ESC" -eq 0 ] && [ "$INC_DOWN" -gt 0 ] || return 0
+    local down_for=$(( $(date +%s) - INC_DOWN ))
+    [ "$down_for" -ge "$ESCALATE_AFTER" ] || return 0
+    INC_ESC=1
+    incident_save
+    log "Incident escalated: $CONTAINER down for ${down_for}s"
+    NOTIFY_COOLDOWN=0 alert CRIT "ipleak:$CONTAINER" "$CONTAINER still down" \
+        "Down $(fmt_dur "$down_for") without a break and automatic restarts have not brought it back. Manual action needed.
+Cause: $INC_CAUSE
+Check: $LOGFILE"
+}
+
+incident_clean_check() {   # called on a fully clean check; resolves after RECOVERY_HOLD
+    incident_load || return 0
+    local now
+    now="$(date +%s)"
+    if [ "$INC_CLEAN" -eq 0 ]; then
+        INC_CLEAN="$now"
+        INC_DOWN=0
+        incident_save
+        return 0
+    fi
+    [ $((now - INC_CLEAN)) -ge "$RECOVERY_HOLD" ] || return 0
+    log "Incident resolved: $INC_CYCLES stop(s) over $((INC_CLEAN - INC_START))s; clean since $(date -d "@$INC_CLEAN" '+%H:%M:%S')"
+    alert_clear "ipleak:$CONTAINER" "$CONTAINER recovered" \
+        "Back to normal after $(fmt_dur $((INC_CLEAN - INC_START))) ($INC_CYCLES stop/start cycle(s)), checking clean for $((RECOVERY_HOLD / 60))m.
+Cause: $INC_CAUSE"
+    rm -f "$INCIDENT_FILE"
+}
+
 file_age() {   # file_age <path> -> seconds since mtime; non-zero if unreadable
     local mtime now
     mtime="$(stat -c %Y "$1" 2>/dev/null)"
@@ -321,13 +428,21 @@ trap 'rm -f "$RUNLOCK"' EXIT INT TERM
 # --- start ---
 rotate_logs
 
-# A timeout leaves this empty, which the stopped-path below already handles the
-# same way it handles a container that does not exist.
 RUNNING="$(docker_run "$DOCKER_TIMEOUT" "inspect(Running)" inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)"
+RUNNING_RC=$?
+
+# A timeout says nothing about the container. v2.3 read the empty result as
+# "stopped" and tried a restart, which also timed out and raised a false
+# "restart failed" (2026-10-05 06:52) while the container was in fact running.
+if [ "$RUNNING_RC" -eq 124 ]; then
+    log "Warning: skipping run, container state unknown (dockerd unresponsive)"
+    exit 0
+fi
 
 # --- container stopped path ---
 if [ "$RUNNING" != "true" ]; then
     NOWSEC="$(date +%s)"
+    incident_escalate_if_stuck
 
     # intentional leak-stop recovery path
     if [ -f "$LOCKFILE" ]; then
@@ -347,9 +462,7 @@ if [ "$RUNNING" != "true" ]; then
         if [ "$RESTART_COUNT" -ge "$MAX_RESTARTS_PER_WINDOW" ]; then
             log "Container $CONTAINER restart suppressed: reached $RESTART_COUNT attempts in current ${RESTART_WINDOW}s window"
             write_json_marker "$LAST_RESTART_FILE" "restart_suppressed" "" "" "max restart attempts reached"
-            alert HIGH "ipleak-restart:$CONTAINER" "Container restart suppressed" \
-                "$CONTAINER hit the restart limit ($MAX_RESTARTS_PER_WINDOW per $((RESTART_WINDOW / 60))m) after a leak stop and will stay down until the window clears.
-Check: $LOGFILE"
+            incident_event 1 1 "Hit the restart limit ($MAX_RESTARTS_PER_WINDOW per $((RESTART_WINDOW / 60))m) after a leak stop; stays down until the window clears."
             exit 0
         fi
 
@@ -373,14 +486,13 @@ Check: $LOGFILE"
         if docker_run "$DOCKER_TIMEOUT" "start" start "$CONTAINER" >/dev/null 2>&1; then
             log "Container $CONTAINER started successfully; startup grace period will apply"
             write_json_marker "$LAST_RESTART_FILE" "restart_succeeded" "" "" "container started successfully after leak event"
-            alert_clear "ipleak-restart:$CONTAINER" "Container restarted" \
-                "$CONTAINER started again after a leak stop."
+            incident_running
         else
+            # The next attempt follows after RESTART_COOLDOWN; only a long
+            # unbroken outage escalates (incident_escalate_if_stuck).
             log "Warning: automatic restart attempt failed for $CONTAINER"
             write_json_marker "$LAST_RESTART_FILE" "restart_failed" "" "" "docker start failed after leak event"
-            alert CRIT "ipleak-restart:$CONTAINER" "Container restart failed" \
-                "$CONTAINER is stopped after a leak event and the automatic restart failed. Manual action needed.
-Check: $LOGFILE"
+            incident_event 1 1 "Stopped after a leak event and the automatic restart failed; retrying."
         fi
 
         exit 0
@@ -400,9 +512,7 @@ Check: $LOGFILE"
     if [ "$RESTART_COUNT" -ge "$MAX_RESTARTS_PER_WINDOW" ]; then
         log "Warning: container $CONTAINER is not running; unexpected-stop restart suppressed after $RESTART_COUNT attempts in current ${RESTART_WINDOW}s window"
         write_json_marker "$LAST_RESTART_FILE" "restart_suppressed" "" "" "unexpected stop; max restart attempts reached"
-        alert HIGH "ipleak-restart:$CONTAINER" "Container restart suppressed" \
-            "$CONTAINER stopped unexpectedly and hit the restart limit ($MAX_RESTARTS_PER_WINDOW per $((RESTART_WINDOW / 60))m). It will stay down until the window clears.
-Check: $LOGFILE"
+        incident_event 1 1 "Stopped unexpectedly and hit the restart limit ($MAX_RESTARTS_PER_WINDOW per $((RESTART_WINDOW / 60))m); stays down until the window clears."
         exit 0
     fi
 
@@ -415,18 +525,17 @@ Check: $LOGFILE"
     if docker_run "$DOCKER_TIMEOUT" "start" start "$CONTAINER" >/dev/null 2>&1; then
         log "Container $CONTAINER started successfully after unexpected stop; startup grace period will apply"
         write_json_marker "$LAST_RESTART_FILE" "restart_unexpected_stop" "" "" "container restarted after unexpected stop"
-        alert_clear "ipleak-restart:$CONTAINER" "Container restarted" \
-            "$CONTAINER started again after an unexpected stop."
+        incident_running
     else
         log "Warning: automatic restart after unexpected stop failed for $CONTAINER"
         write_json_marker "$LAST_RESTART_FILE" "restart_failed" "" "" "unexpected stop; docker start failed"
-        alert CRIT "ipleak-restart:$CONTAINER" "Container restart failed" \
-            "$CONTAINER stopped unexpectedly and the automatic restart failed. Manual action needed.
-Check: $LOGFILE"
+        incident_event 1 1 "Stopped unexpectedly and the automatic restart failed; retrying."
     fi
 
     exit 0
 fi
+
+incident_running
 
 # --- detect container uptime (grace period) ---
 UPTIME="$(docker_run "$DOCKER_TIMEOUT" "inspect(StartedAt)" inspect -f '{{.State.StartedAt}}' "$CONTAINER" 2>/dev/null | xargs -I{} date -d {} +%s 2>/dev/null)"
@@ -441,27 +550,50 @@ if [ -n "$UPTIME" ]; then
 fi
 
 # --- fast check: VPN tunnel interface (every 10s) ---
-# A timeout here is treated as "tunnel not verifiable" and so fails closed
-# (container stopped), which is the safe direction for a leak guard.
-if ! docker_run "$DOCKER_EXEC_TIMEOUT" "exec(ip link tun0)" exec "$CONTAINER" ip link show tun0 2>/dev/null | grep -q "UP"; then
-    if ( set -C; : > "$LOCKFILE" ) 2>/dev/null; then
-        log "VPN tunnel down (tun0 not UP); stopping container $CONTAINER"
+# A timeout means "tunnel not verifiable", not "tunnel down". It still fails
+# closed, but only after TUN_TIMEOUT_STRIKES in a row (~10s apart): one slow
+# dockerd answer under disk load is common, and the container's own iptables
+# kill switch covers the gap. A tun0 that answers but is not UP stops at once.
+TUN_OUT="$(docker_run "$DOCKER_EXEC_TIMEOUT" "exec(ip link tun0)" exec "$CONTAINER" ip link show tun0 2>/dev/null)"
+TUN_RC=$?
+TUN_CAUSE=""
+if [ "$TUN_RC" -eq 124 ]; then
+    NOWSEC="$(date +%s)"
+    STRIKES=0 STRIKE_LAST=0
+    [ -f "$TUN_STRIKE_FILE" ] && IFS='|' read -r STRIKES STRIKE_LAST < "$TUN_STRIKE_FILE"
+    case "$STRIKES" in ''|*[!0-9]*) STRIKES=0 ;; esac
+    case "$STRIKE_LAST" in ''|*[!0-9]*) STRIKE_LAST=0 ;; esac
+    [ $((NOWSEC - STRIKE_LAST)) -gt "$TUN_STRIKE_WINDOW" ] && STRIKES=0
+    STRIKES=$((STRIKES + 1))
+    echo "$STRIKES|$NOWSEC" > "$TUN_STRIKE_FILE"
+    if [ "$STRIKES" -lt "$TUN_TIMEOUT_STRIKES" ]; then
+        log "Warning: tun0 check unverifiable (dockerd unresponsive), strike $STRIKES/$TUN_TIMEOUT_STRIKES; retrying next run"
+        exit 0
+    fi
+    TUN_CAUSE="dockerd unresponsive: the tun0 check timed out ${STRIKES}x in a row, so it was stopped as a precaution. The VPN was not confirmed down."
+elif ! printf '%s\n' "$TUN_OUT" | grep -q "UP"; then
+    TUN_CAUSE="VPN tunnel down: tun0 was not UP."
+fi
+[ -z "$TUN_CAUSE" ] && rm -f "$TUN_STRIKE_FILE"
 
-        alert CRIT "ipleak-tun0:$CONTAINER" "VPN tunnel down - container stopped" \
-            "$CONTAINER was stopped because tun0 was not UP. It stays down until the tunnel is healthy again.
-Check: $LOGFILE"
+if [ -n "$TUN_CAUSE" ]; then
+    rm -f "$TUN_STRIKE_FILE"
+    if ( set -C; : > "$LOCKFILE" ) 2>/dev/null; then
+        log "Stopping container $CONTAINER -- $TUN_CAUSE"
+
+        incident_event 1 1 "$TUN_CAUSE"
 
         write_json_marker \
             "$LAST_LEAK_FILE" \
             "tun0_down" \
             "" \
             "" \
-            "latest tun0-down event"
+            "$TUN_CAUSE"
 
         set_restart_policy "$RESTART_POLICY_LEAK"
 
         if docker_run "$DOCKER_STOP_TIMEOUT" "stop" stop "$CONTAINER" >/dev/null 2>&1; then
-            log "Container $CONTAINER stopped due to VPN tunnel down"
+            log "Container $CONTAINER stopped"
         else
             log "Warning: failed to stop container $CONTAINER after tun0-down detection"
         fi
@@ -469,7 +601,15 @@ Check: $LOGFILE"
         date +%s > "$RESTARTSTAMP"
         exit 1
     else
-        log "VPN tunnel still down, lockfile already exists"
+        # A restart brought the container back but the tunnel still fails. v2.3
+        # only logged here and left it running on the image's kill switch alone;
+        # stop it again (silently -- the incident already reported it).
+        log "Stopping container $CONTAINER again (lock held) -- $TUN_CAUSE"
+        incident_event 1 0 "$TUN_CAUSE"
+        set_restart_policy "$RESTART_POLICY_LEAK"
+        docker_run "$DOCKER_STOP_TIMEOUT" "stop" stop "$CONTAINER" >/dev/null 2>&1 || \
+            log "Warning: failed to stop container $CONTAINER (lock held)"
+        date +%s > "$RESTARTSTAMP"
         exit 1
     fi
 fi
@@ -517,6 +657,9 @@ if [ "$PUBLIC_IP" = "$CONTAINER_IP" ]; then
         alert CRIT "ipleak-ip:$CONTAINER" "IP leak - container stopped" \
             "$CONTAINER reported the same external IP as the host, so it was stopped to prevent exposure.
 Check: $LOGFILE"
+        # Opened silently: the CRIT above is the message. This only keeps the
+        # restart churn that follows from sending anything more.
+        incident_event 1 0 "IP leak: container IP matched the host."
 
         write_json_marker \
             "$LAST_LEAK_FILE" \
@@ -547,8 +690,7 @@ else
     # good AND the addresses differ, so it is the only honest place to clear.
     alert_clear "ipleak-ip:$CONTAINER" "IP leak cleared" \
         "$CONTAINER external IP differs from the host again."
-    alert_clear "ipleak-tun0:$CONTAINER" "VPN tunnel recovered" \
-        "tun0 is UP and $CONTAINER is checking clean."
+    incident_clean_check
     alert_clear "ipleak-deadman:$CONTAINER" "Leak watchdog running again" \
         "The leak check is logging normally; VPN leak protection is active."
 
